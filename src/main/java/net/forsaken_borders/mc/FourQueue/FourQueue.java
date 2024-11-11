@@ -164,12 +164,10 @@ public final class FourQueue {
                     .thenAccept((result) -> {
                         if (result.isSuccessful()) {
                             // Schedule for the next player to be moved
-                            _logger.info("Player {} ({}) has been moved to the main server", player.getUsername(), player.getUniqueId());
                             _queue.removePlayer(player.getUniqueId());
                             _playerMoverService.schedule(this::MovePlayersAsync, _config.getQuickMovePlayerDelay(), TimeUnit.MILLISECONDS);
                         } else {
                             // If the player can't be moved, try again with the normal delay
-                            _logger.warn("Failed to move player {} ({}) to main server", player.getUsername(), player.getUniqueId());
                             _playerMoverService.schedule(this::MovePlayersAsync, _config.getMovePlayerDelay(), TimeUnit.MILLISECONDS);
                         }
 
@@ -197,7 +195,6 @@ public final class FourQueue {
                     })
                     .exceptionally((error) -> {
                         // If the player can't be moved, try again with the normal delay
-                        _logger.warn("Failed to move player {} ({}) to main server", player.getUsername(), player.getUniqueId(), error);
                         _playerMoverService.schedule(this::MovePlayersAsync, _config.getMovePlayerDelay(), TimeUnit.MILLISECONDS);
                         return null;
                     });
