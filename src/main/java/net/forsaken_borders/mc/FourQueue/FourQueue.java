@@ -14,6 +14,7 @@ import com.velocitypowered.api.proxy.ProxyServer;
 import com.velocitypowered.api.proxy.ServerConnection;
 import com.velocitypowered.api.proxy.server.RegisteredServer;
 import net.forsaken_borders.mc.FourQueue.Commands.QueueCommand;
+import net.forsaken_borders.mc.FourQueue.Commands.ReloadCommand;
 import net.kyori.adventure.text.Component;
 import org.slf4j.Logger;
 
@@ -34,8 +35,9 @@ public final class FourQueue {
     private final ProxyServer _server;
     private final QueueHolder _queue;
     private final Logger _logger;
+    private final Path _dataPath;
 
-    private final FourQueueConfig _config;
+    private FourQueueConfig _config;
     private RegisteredServer _mainServer;
     private RegisteredServer _limboServer;
 
@@ -43,14 +45,24 @@ public final class FourQueue {
     public FourQueue(ProxyServer proxyServer, Logger logger, @DataDirectory Path dataPath) throws IOException {
         // TODO: Use Velocity's built in scheduler
         _playerMoverService = new ScheduledThreadPoolExecutor(1);
-        _config = FourQueueConfig.Load(dataPath, logger);
         _server = proxyServer;
+        _dataPath = dataPath;
         _logger = logger;
+
+        reloadConfig();
         _queue = new QueueHolder();
+    }
+
+    public void reloadConfig() throws IOException {
+        _config = FourQueueConfig.Load(_dataPath, _logger);
     }
 
     public QueueHolder getQueue() {
         return _queue;
+    }
+
+    public RegisteredServer getMainServer() {
+        return _mainServer;
     }
 
     @Subscribe
@@ -88,10 +100,17 @@ public final class FourQueue {
         // Register the /queue command
         CommandManager commandManager = _server.getCommandManager();
         commandManager.register(commandManager
-                .metaBuilder("queue")
-                .aliases("q")
+                .metaBuilder("4queue:queue")
+                .aliases("queue", "q")
                 .plugin(this)
                 .build(), new QueueCommand(this));
+
+        // Register the /4queue reload command
+        commandManager.register(commandManager
+                .metaBuilder("4queue:reload")
+                .plugin(this)
+                .build(), new ReloadCommand(this)
+        );
 
         // Unregister the /server command
         commandManager.unregister("server");
