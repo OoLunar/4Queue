@@ -18,7 +18,6 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.Optional;
 import java.util.UUID;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -64,21 +63,17 @@ public final class FourQueue {
         _mainServer = mainServerOptional.get();
         _limboServer = limboServerOptional.get();
 
-        // Unregister the /server command to prevent abuse
-        CommandManager commandManager = _server.getCommandManager();
-        commandManager.unregister("server");
-        _logger.warn("Removed the /server command to prevent abuse. TODO: Add a permissions plugin that disallows that command by default.");
-
         // Register the /queue command
+        CommandManager commandManager = _server.getCommandManager();
         commandManager.register(commandManager
                 .metaBuilder("queue")
                 .aliases("q")
                 .plugin(this)
                 .build(), new QueueCommand(_queue));
-        _logger.info("4Queue has been initialized.");
 
         // Start moving players
         _playerMoverService.scheduleWithFixedDelay(this::MovePlayersAsync, 0, _config.MovePlayerDelay(), TimeUnit.MILLISECONDS);
+        _logger.info("4Queue has been initialized.");
     }
 
     @Subscribe
@@ -94,33 +89,46 @@ public final class FourQueue {
         _queue.removePlayer(event.getPlayer().getUniqueId());
     }
 
-    private CompletableFuture<Void> MovePlayersAsync() {
-        // Attempt to get the next player.
-        // If the player is null, then nobody is in limbo.
+    private void MovePlayersAsync() {
         Player player = getNextPlayer();
         if (player == null) {
-            return CompletableFuture.completedFuture(null);
+            // No players in queue, wait X ms for the next attempt
+            _playerMoverService.schedule(this::MovePlayersAsync, _config.MovePlayerDelay(), TimeUnit.MILLISECONDS);
+            return;
         }
 
-        // Try to see if the main server is online
-        try {
-            _mainServer.ping().get();
-        } catch (Exception error) {
-            _logger.warn("Unable to reach the main server: {}", _config.MainHostname(), error);
-            return CompletableFuture.completedFuture(null);
-        }
+        // Try pinging the main server asynchronously
+        _mainServer.ping().thenAccept(ping -> {
+            // Try to move the player to the main server
+            player.createConnectionRequest(_mainServer).connect().thenRun(() -> {
+                // If successful, schedule the next move with a shorter delay
+                _queue.removePlayer(player.getUniqueId());
+                _playerMoverService.schedule(this::MovePlayersAsync, _config.SuccessfulMoveDelay(), TimeUnit.MILLISECONDS);
+            }).exceptionally(error -> {
+                String playerUsername = player.getUsername();
+                UUID playerUuid = player.getUniqueId();
 
-        // Try moving the player to the main server
-        try {
-            player.createConnectionRequest(_mainServer).connect().get();
-            _queue.removePlayer(player.getUniqueId());
-        } catch (Exception error) {
-            _logger.warn("Unable to reach the main server: {}", _config.MainHostname(), error);
-            return CompletableFuture.completedFuture(null);
-        }
+                // Log the failure to move to the main server
+                _logger.warn("Failed to move player {} ({}) to main server", playerUsername, playerUuid, error);
 
-        // If it worked, then keep trying to send more players
-        return CompletableFuture.runAsync(this::sendPlayerAsync);
+                // Try to move the player back to the limbo server
+                player.createConnectionRequest(_limboServer).connect().exceptionally(error2 -> {
+                    // If moving to limbo also fails, kick the player
+                    _logger.error("Failed to move player {} ({}) back to limbo server", playerUsername, playerUuid, error2);
+                    player.disconnect(Component.text("A lot of things just went wrong. Please try again in maybe 10 minutes."));
+                    return null;
+                });
+
+                // Schedule the next attempt to move a player with the normal delay
+                _playerMoverService.schedule(this::MovePlayersAsync, _config.MovePlayerDelay(), TimeUnit.MILLISECONDS);
+                return null;
+            });
+        }).exceptionally(error -> {
+            // If the main server is unreachable, try again with the normal delay
+            _logger.warn("Main server unreachable: {}", error.getMessage());
+            _playerMoverService.schedule(this::MovePlayersAsync, _config.MovePlayerDelay(), TimeUnit.MILLISECONDS);
+            return null;
+        });
     }
 
     private Player getNextPlayer() {
@@ -141,25 +149,6 @@ public final class FourQueue {
 
             // We found a player who's still logged in
             return optionalPlayer.get();
-        }
-    }
-
-    private CompletableFuture<Void> sendPlayerAsync() {
-        // Attempt to get the next player.
-        // If the player is null, then nobody is in limbo.
-        Player player = getNextPlayer();
-        if (player == null) {
-            return CompletableFuture.completedFuture(null);
-        }
-
-        try {
-            player.createConnectionRequest(_limboServer).connect().get();
-            _queue.removePlayer(player.getUniqueId());
-            return CompletableFuture.completedFuture(_playerMoverService.schedule(() -> {
-            }, _config.MovePlayerDelay(), TimeUnit.MILLISECONDS)).thenRunAsync(this::sendPlayerAsync);
-        } catch (Exception error) {
-            _logger.info("Unable to send players to the main server: {}", _config.MainHostname(), error);
-            return CompletableFuture.completedFuture(null);
         }
     }
 }

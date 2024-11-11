@@ -57,15 +57,6 @@ public final class QueueHolder {
         }
     }
 
-    public UUID getNextPlayer() {
-        _lock.acquireUninterruptibly();
-        try {
-            return _queue.poll();
-        } finally {
-            _lock.release();
-        }
-    }
-
     public int getTotalPlayerCount() {
         return _queue.size();
     }
