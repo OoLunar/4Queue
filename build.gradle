@@ -22,9 +22,6 @@ repositories {
 dependencies {
     compileOnly("com.velocitypowered:velocity-api:3.4.0-SNAPSHOT")
     annotationProcessor("com.velocitypowered:velocity-api:3.4.0-SNAPSHOT")
-
-    // Add the SnakeYAML dependency
-    implementation 'org.yaml:snakeyaml:2.0'
 }
 
 def targetJavaVersion = 17

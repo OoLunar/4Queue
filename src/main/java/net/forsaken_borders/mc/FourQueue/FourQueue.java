@@ -1,14 +1,17 @@
 package net.forsaken_borders.mc.FourQueue;
 
+import com.google.inject.Inject;
 import com.velocitypowered.api.command.CommandManager;
 import com.velocitypowered.api.event.Subscribe;
 import com.velocitypowered.api.event.connection.DisconnectEvent;
+import com.velocitypowered.api.event.player.KickedFromServerEvent;
 import com.velocitypowered.api.event.player.ServerPostConnectEvent;
 import com.velocitypowered.api.event.proxy.ProxyInitializeEvent;
 import com.velocitypowered.api.plugin.Plugin;
 import com.velocitypowered.api.plugin.annotation.DataDirectory;
 import com.velocitypowered.api.proxy.Player;
 import com.velocitypowered.api.proxy.ProxyServer;
+import com.velocitypowered.api.proxy.ServerConnection;
 import com.velocitypowered.api.proxy.server.RegisteredServer;
 import net.forsaken_borders.mc.FourQueue.Commands.QueueCommand;
 import net.kyori.adventure.text.Component;
@@ -16,6 +19,7 @@ import org.slf4j.Logger;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.Iterator;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ScheduledExecutorService;
@@ -27,35 +31,53 @@ public final class FourQueue {
     public static final String PositionQueue = "You're currently in position %d of %d";
 
     private final ScheduledExecutorService _playerMoverService;
-    private final FourQueueConfig _config;
     private final ProxyServer _server;
     private final QueueHolder _queue;
     private final Logger _logger;
 
+    private final FourQueueConfig _config;
     private RegisteredServer _mainServer;
     private RegisteredServer _limboServer;
 
+    @Inject
     public FourQueue(ProxyServer proxyServer, Logger logger, @DataDirectory Path dataPath) throws IOException {
+        // TODO: Use Velocity's built in scheduler
         _playerMoverService = new ScheduledThreadPoolExecutor(1);
-        _config = FourQueueConfig.Load(dataPath.resolve("config.json").toFile(), logger);
+        _config = FourQueueConfig.Load(dataPath, logger);
         _server = proxyServer;
         _logger = logger;
         _queue = new QueueHolder();
     }
 
+    public QueueHolder getQueue() {
+        return _queue;
+    }
+
     @Subscribe
     public void onProxyInitialization(ProxyInitializeEvent event) {
         // See if we can find the main server
-        var mainServerOptional = _server.getServer(_config.MainHostname());
-        if (mainServerOptional.isEmpty()) {
-            _logger.error("The main server was not registered with Velocity: {}", _config.MainHostname());
+        String mainHostname = _config.getMainHostname();
+        if (mainHostname == null || mainHostname.isBlank()) {
+            _logger.error("The main server hostname is not set in the config");
             return;
         }
 
-        // See if we can find the limbo
-        var limboServerOptional = _server.getServer(_config.LimboHostname());
+        var mainServerOptional = _server.getServer(mainHostname);
+        if (mainServerOptional.isEmpty()) {
+            _logger.error("The main server was not registered with Velocity: {}", _config.getMainHostname());
+            return;
+        }
+
+        // See if we can find the limbo server
+        String limboHostname = _config.getLimboHostname();
+        if (limboHostname == null || limboHostname.isBlank()) {
+            _logger.error("The limbo server hostname is not set in the config");
+            return;
+        }
+
+        var limboServerOptional = _server.getServer(limboHostname);
         if (limboServerOptional.isEmpty()) {
-            _logger.error("The limbo server was not registered with Velocity: {}", _config.MainHostname());
+            _logger.error("The limbo server was not registered with Velocity: {}", _config.getMainHostname());
             return;
         }
 
@@ -69,10 +91,13 @@ public final class FourQueue {
                 .metaBuilder("queue")
                 .aliases("q")
                 .plugin(this)
-                .build(), new QueueCommand(_queue));
+                .build(), new QueueCommand(this));
+
+        // Unregister the /server command
+        commandManager.unregister("server");
 
         // Start moving players
-        _playerMoverService.scheduleWithFixedDelay(this::MovePlayersAsync, 0, _config.MovePlayerDelay(), TimeUnit.MILLISECONDS);
+        _playerMoverService.schedule(this::MovePlayersAsync, _config.getMovePlayerDelay(), TimeUnit.MILLISECONDS);
         _logger.info("4Queue has been initialized.");
     }
 
@@ -80,53 +105,87 @@ public final class FourQueue {
     @SuppressWarnings("UnstableApiUsage")
     public void onJoin(ServerPostConnectEvent event) {
         Player player = event.getPlayer();
-        int playerPosition = _queue.addPlayer(player.getUniqueId());
-        player.sendMessage(Component.text(PositionQueue.formatted(playerPosition, _queue.getTotalPlayerCount())));
+        UUID uuid = player.getUniqueId();
+        if (event.getPreviousServer() != _limboServer || _queue.getPlayerPosition(uuid) == -1) {
+            int playerPosition = _queue.addPlayer(uuid);
+            player.sendActionBar(Component.text(PositionQueue.formatted(playerPosition, _queue.getTotalPlayerCount())));
+            _logger.debug("Player {} ({}) is in position {} of {}", player.getUsername(), uuid, playerPosition, _queue.getTotalPlayerCount());
+        }
     }
 
     @Subscribe
     public void onLeave(DisconnectEvent event) {
-        _queue.removePlayer(event.getPlayer().getUniqueId());
+        Player player = event.getPlayer();
+        UUID uuid = player.getUniqueId();
+        _logger.debug("Player {} ({}) is leaving...", player.getUsername(), uuid);
+        _queue.removePlayer(uuid);
+    }
+
+    @Subscribe
+    public void onKick(KickedFromServerEvent event) {
+        Player player = event.getPlayer();
+        UUID uuid = player.getUniqueId();
+        _logger.debug("Player {} ({}) was kicked from the server", player.getUsername(), uuid);
+        _queue.removePlayer(uuid);
     }
 
     private void MovePlayersAsync() {
         Player player = getNextPlayer();
         if (player == null) {
             // No players in queue, wait X ms for the next attempt
-            _playerMoverService.schedule(this::MovePlayersAsync, _config.MovePlayerDelay(), TimeUnit.MILLISECONDS);
+            _logger.debug("No players in queue, waiting {}ms for the next attempt", _config.getMovePlayerDelay());
+            _playerMoverService.schedule(this::MovePlayersAsync, _config.getMovePlayerDelay(), TimeUnit.MILLISECONDS);
             return;
         }
 
         // Try pinging the main server asynchronously
         _mainServer.ping().thenAccept(ping -> {
             // Try to move the player to the main server
-            player.createConnectionRequest(_mainServer).connect().thenRun(() -> {
-                // If successful, schedule the next move with a shorter delay
-                _queue.removePlayer(player.getUniqueId());
-                _playerMoverService.schedule(this::MovePlayersAsync, _config.SuccessfulMoveDelay(), TimeUnit.MILLISECONDS);
-            }).exceptionally(error -> {
-                String playerUsername = player.getUsername();
-                UUID playerUuid = player.getUniqueId();
+            player.createConnectionRequest(_mainServer).connect()
+                    .thenAccept((result) -> {
+                        if (result.isSuccessful()) {
+                            // Schedule for the next player to be moved
+                            _logger.info("Player {} ({}) has been moved to the main server", player.getUsername(), player.getUniqueId());
+                            _queue.removePlayer(player.getUniqueId());
+                            _playerMoverService.schedule(this::MovePlayersAsync, _config.getQuickMovePlayerDelay(), TimeUnit.MILLISECONDS);
+                        } else {
+                            // If the player can't be moved, try again with the normal delay
+                            _logger.warn("Failed to move player {} ({}) to main server", player.getUsername(), player.getUniqueId());
+                            _playerMoverService.schedule(this::MovePlayersAsync, _config.getMovePlayerDelay(), TimeUnit.MILLISECONDS);
+                        }
 
-                // Log the failure to move to the main server
-                _logger.warn("Failed to move player {} ({}) to main server", playerUsername, playerUuid, error);
+                        // Foreach player in the queue, send them a message with their position
+                        int i = 1;
+                        for (Iterator<UUID> it = _queue.getAllPlayers(); it.hasNext(); ) {
+                            UUID uuid = it.next();
+                            Optional<Player> optionalPlayer = _server.getPlayer(uuid);
+                            if (optionalPlayer.isEmpty()) {
+                                _queue.removePlayer(uuid);
+                                continue;
+                            }
 
-                // Try to move the player back to the limbo server
-                player.createConnectionRequest(_limboServer).connect().exceptionally(error2 -> {
-                    // If moving to limbo also fails, kick the player
-                    _logger.error("Failed to move player {} ({}) back to limbo server", playerUsername, playerUuid, error2);
-                    player.disconnect(Component.text("A lot of things just went wrong. Please try again in maybe 10 minutes."));
-                    return null;
-                });
+                            // Test if the player is in the same server as the main server
+                            Player queuePlayer = optionalPlayer.get();
+                            Optional<ServerConnection> optionalServerConnection = queuePlayer.getCurrentServer();
+                            if (optionalServerConnection.isPresent() && optionalServerConnection.get().getServer() == _mainServer) {
+                                _queue.removePlayer(queuePlayer.getUniqueId());
+                                continue;
+                            }
 
-                // Schedule the next attempt to move a player with the normal delay
-                _playerMoverService.schedule(this::MovePlayersAsync, _config.MovePlayerDelay(), TimeUnit.MILLISECONDS);
-                return null;
-            });
+                            queuePlayer.sendActionBar(Component.text(PositionQueue.formatted(i, _queue.getTotalPlayerCount())));
+                            i++;
+                        }
+                    })
+                    .exceptionally((error) -> {
+                        // If the player can't be moved, try again with the normal delay
+                        _logger.warn("Failed to move player {} ({}) to main server", player.getUsername(), player.getUniqueId(), error);
+                        _playerMoverService.schedule(this::MovePlayersAsync, _config.getMovePlayerDelay(), TimeUnit.MILLISECONDS);
+                        return null;
+                    });
         }).exceptionally(error -> {
             // If the main server is unreachable, try again with the normal delay
             _logger.warn("Main server unreachable: {}", error.getMessage());
-            _playerMoverService.schedule(this::MovePlayersAsync, _config.MovePlayerDelay(), TimeUnit.MILLISECONDS);
+            _playerMoverService.schedule(this::MovePlayersAsync, _config.getMovePlayerDelay(), TimeUnit.MILLISECONDS);
             return null;
         });
     }

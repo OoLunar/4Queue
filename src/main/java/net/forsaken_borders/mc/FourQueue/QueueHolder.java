@@ -1,5 +1,6 @@
 package net.forsaken_borders.mc.FourQueue;
 
+import java.util.Iterator;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Semaphore;
@@ -59,5 +60,9 @@ public final class QueueHolder {
 
     public int getTotalPlayerCount() {
         return _queue.size();
+    }
+
+    public Iterator<UUID> getAllPlayers() {
+        return _queue.iterator();
     }
 }
